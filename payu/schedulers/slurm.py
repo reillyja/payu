@@ -35,8 +35,8 @@ class Slurm(Scheduler):
         pbs_flags.append('--ntasks={}'.format(pbs_config.get('ncpus')))
 
         # Flags which need to be addressed
-        pbs_flags.append('--qos=debug')
-        pbs_flags.append('--cluster=c4')
+#        pbs_flags.append('--qos=debug')
+#        pbs_flags.append('--cluster=c4')
 
         # Construct job submission command
         cmd = 'sbatch {flags} --wrap="{python} {script}"'.format(

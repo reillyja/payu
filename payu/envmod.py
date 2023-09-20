@@ -83,7 +83,7 @@ def module(command, *args):
               ''.format(command))
         return
 
-    modulecmd = ('{0}/bin/modulecmd'.format(os.environ['MODULESHOME']))
+    modulecmd = ('{0}/libexec/lmod'.format(os.environ['MODULESHOME']))
 
     cmd = '{0} python {1} {2}'.format(modulecmd, command, ' '.join(args))
 
@@ -99,10 +99,20 @@ def lib_update(required_libs, lib_name):
     from payu import fsops
 
     for lib_filename, lib_path in required_libs.items():
-        if lib_filename.startswith(lib_name) and lib_path.startswith('/apps/'): 
-            # Load nci's /apps/ version of module if required 
+        if lib_filename.startswith(lib_name) and lib_path.startswith('/software/setonix'): 
+            ### Load nci's /apps/ version of module if required 
+            # Load Pawseys /software/setonix version of module if required
             # pylint: disable=unbalanced-tuple-unpacking
-            mod_name, mod_version = fsops.splitpath(lib_path)[2:4]
+            for dir in reversed(fsops.splitpath(lib_path)):
+                dir_arr=dir.split('-')
+                ### Assume we're in the right place if the last toke matches
+                ### the pattern of a spack id
+                if len(dir_arr[-1]) == 32 and dir_arr[-1].isalnum() and dir_arr[-1].islower():
+                    break
+            ### Bad assumption - version names never contain hyphens
+            mod_name='-'.join(dir_arr[:-2])
+            mod_version=dir_arr[-2]
+            #mod_name, mod_version = fsops.splitpath(lib_path)[2:4]
 
             module('unload', mod_name)
             module('load', os.path.join(mod_name, mod_version))
