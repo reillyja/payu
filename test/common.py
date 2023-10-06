@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import os
+import stat
 from pathlib import Path
 
 import yaml
@@ -12,12 +13,16 @@ from payu.subcommands.init_cmd import runcmd as payu_init
 from payu.subcommands.setup_cmd import runcmd as payu_setup_orignal
 from payu.subcommands.sweep_cmd import runcmd as payu_sweep
 
+ctrldir_basename = 'ctrl'
+
 testdir = Path().cwd() / Path('test')
 tmpdir = testdir / 'tmp'
-ctrldir = tmpdir / 'ctrl'
+ctrldir = tmpdir / ctrldir_basename
 labdir = tmpdir / 'lab'
 workdir = ctrldir / 'work'
 payudir = tmpdir / 'payu'
+
+expt_workdir = labdir / 'work' / ctrldir_basename
 
 print('tmpdir: {}'.format(tmpdir))
 
@@ -41,6 +46,7 @@ config = {
                                         }
                         }
             }
+
 
 @contextmanager
 def cd(directory):
@@ -120,9 +126,10 @@ def make_exe():
     # Create a fake executable file
     bindir = labdir / 'bin'
     bindir.mkdir(parents=True, exist_ok=True)
-    exe = config['exe']
+    exe_path = bindir / config['exe']
     exe_size = 199
-    make_random_file(bindir/exe, exe_size)
+    make_random_file(exe_path, exe_size)
+    exe_path.chmod(exe_path.stat().st_mode | stat.S_IEXEC)
 
 
 def make_payu_exe():
