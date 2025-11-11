@@ -8,29 +8,36 @@
 """
 
 import argparse
-from distutils import sysconfig
+import sysconfig
 import importlib
 import os
 import pkgutil
 import shlex
 import subprocess
 import sys
+import warnings
 
 import payu
 import payu.envmod as envmod
 from payu.fsops import is_conda
 from payu.models import index as supported_models
-from payu.schedulers import index as scheduler_index
+from payu.schedulers import index as scheduler_index, DEFAULT_SCHEDULER_CONFIG
 import payu.subcommands
-
 
 # Default configuration
 DEFAULT_CONFIG = 'config.yaml'
 
+# Force warnings.warn() to omit the source code line in the message
+formatwarning_orig = warnings.formatwarning
+warnings.formatwarning = (
+    lambda message, category, filename, lineno, line=None: (
+        formatwarning_orig(message, category, filename, lineno, line='')
+    )
+)
+
 
 def parse():
     """Parse the command line inputs and execute the subcommand."""
-
     parser = generate_parser()
 
     # Display help if no arguments are provided
@@ -87,54 +94,29 @@ def get_model_type(model_type, config):
         print('payu: error: Unknown model {0}'.format(model_type))
         sys.exit(-1)
 
-def _join_paths(*paths):
-    seen = set()
-    out = []
-    for p in (":".join([p for p in paths if p])).split(":"):
-        if p and p not in seen:
-            out.append(p)
-            seen.add(p)
-    return ":".join(out)
 
 def set_env_vars(init_run=None, n_runs=None, lab_path=None, dir_path=None,
-                 reproduce=False, force=False):
+                 reproduce=False, force=False, force_prune_restarts=False,
+                 sync_restarts=False, sync_ignore_last=False):
     """Construct the environment variables used by payu for resubmissions."""
     payu_env_vars = {}
-#    payu_env_vars['LD_LIBRARY_PATH'] = os.environ.get('LD_LIBRARY_PATH', '')
 
-#    if not is_conda():
-#        # Setup Python dynamic library link
-#        lib_paths = sysconfig.get_config_vars('LIBDIR')
-#        payu_env_vars['LD_LIBRARY_PATH'] = ':'.join(lib_paths)
-#        print(f"LD_LIBRARY_PATH is: {payu_env_vars['LD_LIBRARY_PATH']}")
+    if not is_conda():
+        # Setup Python dynamic library link
+        lib_paths = sysconfig.get_config_vars('LIBDIR')
+        payu_env_vars['LD_LIBRARY_PATH'] = ':'.join(lib_paths)
 
-    # Preserve PYTHONPATH if user/site set it
     if 'PYTHONPATH' in os.environ:
         payu_env_vars['PYTHONPATH'] = os.environ['PYTHONPATH']
 
-   # NEW: preserve and augment LD_LIBRARY_PATH with Cray NetCDF/HDF5 dirs
-    ld_cur = os.environ.get('LD_LIBRARY_PATH', '')
+    # Set (or import) the path to the PAYU scripts (PAYU_PATH)
+    # NOTE: We may be able to use sys.path[0] here.
+    payu_binpath = os.environ.get('PAYU_PATH')
 
-    lib_candidates = []
-    for base in (
-        os.environ.get('CRAY_NETCDF_PREFIX_DIR'),
-        os.environ.get('NETCDF_DIR'),
-        os.environ.get('CRAY_HDF5_PARALLEL_PREFIX'),
-        os.environ.get('HDF5_DIR'),
-    ):
-        if base:
-            for sub in ('lib', 'lib64'):
-                d = os.path.join(base, sub)
-                if os.path.isdir(d):
-                    lib_candidates.append(d)
+    if not payu_binpath or not os.path.isdir(payu_binpath):
+        payu_binpath = os.path.dirname(sys.argv[0])
 
-    payu_env_vars['LD_LIBRARY_PATH'] = _join_paths(ld_cur, ":".join(lib_candidates))
-
-    # Keep PAYU_PATH logic the same
-    payu_binpath = os.environ.get('PAYU_PATH') or os.path.dirname(sys.argv[0])
-    if os.path.isdir(payu_binpath):
-        payu_env_vars['PAYU_PATH'] = payu_binpath
-    
+    payu_env_vars['PAYU_PATH'] = payu_binpath
 
     # Set the run counters
     if init_run:
@@ -160,73 +142,29 @@ def set_env_vars(init_run=None, n_runs=None, lab_path=None, dir_path=None,
     if force:
         payu_env_vars['PAYU_FORCE'] = force
 
+    if sync_restarts:
+        payu_env_vars['PAYU_SYNC_RESTARTS'] = sync_restarts
+
+    if sync_ignore_last:
+        payu_env_vars['PAYU_SYNC_IGNORE_LAST'] = sync_ignore_last
+
+    if force_prune_restarts:
+        payu_env_vars['PAYU_FORCE_PRUNE_RESTARTS'] = force_prune_restarts
+
     # Pass through important module related environment variables
     module_env_vars = ['MODULESHOME', 'MODULES_CMD', 'MODULEPATH', 'MODULEV']
     for var in module_env_vars:
         if var in os.environ:
             payu_env_vars[var] = os.environ[var]
-    return payu_env_vars
 
-#def set_env_vars(init_run=None, n_runs=None, lab_path=None, dir_path=None,
-#                 reproduce=False, force=False):
-#    """Construct the environment variables used by payu for resubmissions."""
-#    payu_env_vars = {}
-#
-#    #if not is_conda():
-#    #    # Setup Python dynamic library link
-#    #    lib_paths = sysconfig.get_config_vars('LIBDIR')
-#    #    payu_env_vars['LD_LIBRARY_PATH'] = ':'.join(lib_paths)
-#
-#    if 'PYTHONPATH' in os.environ:
-#        payu_env_vars['PYTHONPATH'] = os.environ['PYTHONPATH']
-#
-#    # Set (or import) the path to the PAYU scripts (PAYU_PATH)
-#    # NOTE: We may be able to use sys.path[0] here.
-#    payu_binpath = os.environ.get('PAYU_PATH')
-#
-#    if not payu_binpath or not os.path.isdir(payu_binpath):
-#        payu_binpath = os.path.dirname(sys.argv[0])
-#
-#    payu_env_vars['PAYU_PATH'] = payu_binpath
-#
-#    # Set the run counters
-#    if init_run:
-#        init_run = int(init_run)
-#        assert init_run >= 0
-#        payu_env_vars['PAYU_CURRENT_RUN'] = init_run
-#
-#    if n_runs:
-#        n_runs = int(n_runs)
-#        assert n_runs > 0
-#        payu_env_vars['PAYU_N_RUNS'] = n_runs
-#
-#    # Import explicit project paths
-#    if lab_path:
-#        payu_env_vars['PAYU_LAB_PATH'] = os.path.normpath(lab_path)
-#
-#    if dir_path:
-#        payu_env_vars['PAYU_DIR_PATH'] = os.path.normpath(dir_path)
-#
-#    if reproduce:
-#        payu_env_vars['PAYU_REPRODUCE'] = reproduce
-#
-#    if force:
-#        payu_env_vars['PAYU_FORCE'] = force
-#
-#    # Pass through important module related environment variables
-#    module_env_vars = ['MODULESHOME', 'MODULES_CMD', 'MODULEPATH', 'MODULEV']
-#    for var in module_env_vars:
-#        if var in os.environ:
-#            payu_env_vars[var] = os.environ[var]
-#
-#    return payu_env_vars
+    return payu_env_vars
 
 
 def submit_job(script, config, vars=None):
     """Submit a userscript the scheduler."""
 
     # TODO: Temporary stub to replicate the old approach
-    sched_name = config.get('scheduler', 'slurm')
+    sched_name = config.get('scheduler', DEFAULT_SCHEDULER_CONFIG)
     sched_type = scheduler_index[sched_name]
     sched = sched_type()
     cmd = sched.submit(script, config, vars)

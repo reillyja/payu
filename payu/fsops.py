@@ -61,6 +61,10 @@ def read_config(config_fname=None):
     try:
         with open(config_fname, 'r') as config_file:
             config = yaml.safe_load(config_file)
+
+        # NOTE: A YAML file with no content returns `None`
+        if config is None:
+            config = {}
     except IOError as exc:
         if exc.errno == errno.ENOENT:
             print('payu: warning: Configuration file {0} not found!'
@@ -89,6 +93,12 @@ def read_config(config_fname=None):
               "without 'collate_' prefix")
 
     config['collate'] = collate_config
+
+    # Local "control" path. Must be set here so it can be
+    # scanned for storage points
+    config["control_path"] = config.get('control',
+                                        os.path.dirname(
+                                            os.path.abspath(config_fname)))
 
     return config
 

@@ -12,11 +12,12 @@ title = 'run'
 parameters = {'description': 'Run the model experiment'}
 
 arguments = [args.model, args.config, args.initial, args.nruns,
-             args.laboratory, args.reproduce, args.force]
+             args.laboratory, args.reproduce, args.force,
+             args.force_prune_restarts]
 
 
 def runcmd(model_type, config_path, init_run, n_runs, lab_path,
-           reproduce=False, force=False):
+           reproduce=False, force=False, force_prune_restarts=False):
 
     # Get job submission configuration
     pbs_config = fsops.read_config(config_path)
@@ -24,7 +25,8 @@ def runcmd(model_type, config_path, init_run, n_runs, lab_path,
                                 n_runs=n_runs,
                                 lab_path=lab_path,
                                 reproduce=reproduce,
-                                force=force)
+                                force=force,
+                                force_prune_restarts=force_prune_restarts)
 
     # Set the queue
     # NOTE: Maybe force all jobs on the normal queue
@@ -33,10 +35,8 @@ def runcmd(model_type, config_path, init_run, n_runs, lab_path,
 
     # TODO: Create drivers for servers
     platform = pbs_config.get('platform', {})
-    max_cpus_per_node = platform.get('nodesize', 128)
-    max_ram_per_node = platform.get('nodemem', 256)
-
-
+    max_cpus_per_node = platform.get('nodesize', 48)
+    max_ram_per_node = platform.get('nodemem', 192)
 
     # Adjust the CPUs for any model-specific settings
     # TODO: Incorporate this into the Model driver
@@ -69,11 +69,6 @@ def runcmd(model_type, config_path, init_run, n_runs, lab_path,
 
     n_cpus = n_cpus_request
     n_cpus_per_node = pbs_config.get('npernode', max_cpus_per_node)
-    print(max_cpus_per_node)
-    print(n_cpus_per_node)
-
-    print('----------')
-    #dsada
 
     assert n_cpus_per_node <= max_cpus_per_node
 
@@ -101,11 +96,7 @@ def runcmd(model_type, config_path, init_run, n_runs, lab_path,
 
     # Update the (possibly unchanged) value of ncpus
     pbs_config['ncpus'] = n_cpus
-    #print(pbs_config['scheduler'])
-    #print(pbs_config.keys())
-    pbs_config['nnodes'] = 1 + (n_cpus - 1) // n_cpus_per_node
-    #print(pbs_config['nnodes'])
-    #dsad
+
     # Set memory to use the complete node if unspecified
     pbs_mem = pbs_config.get('mem')
     if not pbs_mem:
@@ -141,7 +132,7 @@ def runscript():
 
         expt.setup()
         expt.run()
-        expt.archive()
+        expt.archive(force_prune_restarts=run_args.force_prune_restarts)
 
         # Finished runs
         if expt.n_runs == 0:

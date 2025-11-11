@@ -11,41 +11,50 @@ from __future__ import print_function
 # Standard Library
 import datetime
 import errno
-import getpass
 import os
+import re
 import resource
 import sys
 import shlex
 import shutil
 import subprocess as sp
 import sysconfig
+from pathlib import Path
+import warnings
 
 # Extensions
 import yaml
+from packaging import version
 
 # Local
 from payu import envmod
 from payu.fsops import mkdir_p, make_symlink, read_config, movetree
-from payu.schedulers.pbs import get_job_info, pbs_env_init, get_job_id
+from payu.fsops import list_archive_dirs
+from payu.fsops import run_script_command
+from payu.fsops import needs_subprocess_shell
+from payu.schedulers import index as scheduler_index, DEFAULT_SCHEDULER_CONFIG
 from payu.models import index as model_index
 import payu.profilers
 from payu.runlog import Runlog
 from payu.manifest import Manifest
+from payu.calendar import parse_date_offset
+from payu.sync import SyncToRemoteArchive
+from payu.metadata import Metadata
 
 # Environment module support on vayu
 # TODO: To be removed
-core_modules = ['python', 'payu', 'modules']
+core_modules = ['python', 'payu']
 
 # Default payu parameters
-default_archive_url = 'dc.nci.org.au'
 default_restart_freq = 5
-default_restart_history = 5
 
 
 class Experiment(object):
 
-    def __init__(self, lab, reproduce=False, force=False):
+    def __init__(self, lab, reproduce=False, force=False, metadata_off=False):
         self.lab = lab
+        # Check laboratory directories are writable
+        self.lab.initialize()
 
         if not force:
             # check environment for force flag under PBS
@@ -54,6 +63,10 @@ class Experiment(object):
             self.force = force
 
         self.start_time = datetime.datetime.now()
+
+        # Initialise experiment metadata - uuid and experiment name
+        self.metadata = Metadata(Path(lab.archive_path), disabled=metadata_off)
+        self.metadata.setup()
 
         # TODO: replace with dict, check versions via key-value pairs
         self.modules = set()
@@ -92,6 +105,9 @@ class Experiment(object):
 
         self.set_output_paths()
 
+        # Create metadata file and move to archive
+        self.metadata.write_metadata(restart_path=self.prior_restart_path)
+
         if not reproduce:
             # check environment for reproduce flag under PBS
             reproduce = os.environ.get('PAYU_REPRODUCE', False)
@@ -122,13 +138,15 @@ class Experiment(object):
 
         self.run_id = None
 
+        self.user_modules_paths = None
+
     def init_models(self):
 
         self.model_name = self.config.get('model')
         assert self.model_name
 
         model_fields = ['model', 'exe', 'input', 'ncpus', 'npernode', 'build',
-                        'mpthreads', 'exe_prefix']
+                        'mpthreads', 'exe_prefix', 'model_config']
 
         # XXX: Temporarily adding this to model config...
         model_fields += ['mask']
@@ -138,13 +156,9 @@ class Experiment(object):
 
         submodels = self.config.get('submodels', [])
 
-        solo_model = self.config.get('model')
-        if not solo_model:
-            sys.exit('payu: error: Unknown model configuration.')
-
         submodel_config = dict((f, self.config[f]) for f in model_fields
                                if f in self.config)
-        submodel_config['name'] = solo_model
+        submodel_config['name'] = self.model_name
 
         submodels.append(submodel_config)
 
@@ -176,40 +190,31 @@ class Experiment(object):
 
         # Initialize counter if unset
         if self.counter is None:
-            # TODO: this logic can probably be streamlined
-            try:
-                restart_dirs = [d for d in os.listdir(self.archive_path)
-                                if d.startswith('restart')]
-            except EnvironmentError as exc:
-                if exc.errno == errno.ENOENT:
-                    restart_dirs = None
-                else:
-                    raise
-
-            # First test for restarts
-            if restart_dirs:
-                self.counter = 1 + max([int(d.lstrip('restart'))
-                                        for d in restart_dirs
-                                        if d.startswith('restart')])
+            # Check for restart index
+            max_restart_index = self.max_output_index(output_type="restart")
+            if max_restart_index is not None:
+                self.counter = 1 + max_restart_index
             else:
-                # repeat runs do not generate restart files, so check outputs
-                try:
-                    output_dirs = [d for d in os.listdir(self.archive_path)
-                                   if d.startswith('output')]
-                except EnvironmentError as exc:
-                    if exc.errno == errno.ENOENT:
-                        output_dirs = None
-                    else:
-                        raise
-
-                # First test for restarts
-                # Now look for output directories
-                if output_dirs:
-                    self.counter = 1 + max([int(d.lstrip('output'))
-                                            for d in output_dirs
-                                            if d.startswith('output')])
+                # Now look for output directories,
+                # as repeat runs do not generate restart files.
+                max_output_index = self.max_output_index()
+                if max_output_index is not None:
+                    self.counter = 1 + max_output_index
                 else:
                     self.counter = 0
+
+    def max_output_index(self, output_type="output"):
+        """Given a output directory type (output or restart),
+        return the maximum index of output directories found"""
+        try:
+            output_dirs = list_archive_dirs(archive_path=self.archive_path,
+                                            dir_type=output_type)
+        except FileNotFoundError:
+            # Archive path does not exist yet
+            return None
+
+        if output_dirs and len(output_dirs):
+            return int(output_dirs[-1].lstrip(output_type))
 
     def set_stacksize(self, stacksize):
 
@@ -221,11 +226,24 @@ class Experiment(object):
         resource.setrlimit(resource.RLIMIT_STACK,
                            (stacksize, resource.RLIM_INFINITY))
 
-    def load_modules(self):
-        # NOTE: This function is increasingly irrelevant, and may be removable.
+    def setup_modules(self):
+        """Setup modules and get paths added to $PATH by user-modules"""
+        envmod.setup()
 
+        # Get user modules info from config
+        user_modulepaths = self.config.get('modules', {}).get('use', [])
+        user_modules = self.config.get('modules', {}).get('load', [])
+
+        # Run module use + load commands for user-defined modules, and
+        # get a set of paths and loaded modules added by loading the modules
+        loaded_mods, paths = envmod.setup_user_modules(user_modules,
+                                                       user_modulepaths)
+        self.user_modules_paths = paths
+        self.loaded_user_modules = [] if loaded_mods is None else loaded_mods
+
+    def load_modules(self):
         # Scheduler
-        sched_modname = self.config.get('scheduler', 'slurm')
+        sched_modname = self.config.get('scheduler', 'pbs')
         self.modules.add(sched_modname)
 
         # MPI library
@@ -236,7 +254,7 @@ class Experiment(object):
         if mpi_modpath:
             envmod.module('use', mpi_modpath)
 
-        mpi_modname = mpi_config.get('module', 'mpich')
+        mpi_modname = mpi_config.get('module', 'openmpi')
         self.modules.add(mpi_modname)
 
         # Unload non-essential modules
@@ -246,19 +264,13 @@ class Experiment(object):
             if len(mod) > 0:
                 print('mod '+mod)
                 mod_base = mod.split('/')[0]
-                if mod_base not in core_modules:
+                if (mod_base not in core_modules and
+                        mod not in self.loaded_user_modules):
                     envmod.module('unload', mod)
 
         # Now load model-dependent modules
         for mod in self.modules:
             envmod.module('load', mod)
-
-        # User-defined modules
-        user_modules = self.config.get('modules', [])
-        for mod in user_modules:
-            envmod.module('load', mod)
-
-        envmod.module('list')
 
         for prof in self.profilers:
             prof.load_modules()
@@ -290,8 +302,7 @@ class Experiment(object):
         self.control_path = self.config.get('control_path')
 
         # Experiment name
-        self.name = self.config.get('experiment',
-                                    os.path.basename(self.control_path))
+        self.name = self.metadata.experiment_name
 
         # Experiment subdirectories
         self.archive_path = os.path.join(self.lab.archive_path, self.name)
@@ -343,12 +354,21 @@ class Experiment(object):
         self.restart_path = os.path.join(self.archive_path, restart_dir)
 
         # Prior restart path
-
+        # Check if there are any restart directories in archive
+        no_restarts = self.max_output_index(output_type="restart") is None
         # Check if a user restart directory is avaiable
         user_restart_dir = self.config.get('restart')
-        if (self.counter == 0 or self.repeat_run) and user_restart_dir:
-            # TODO: Some user friendliness needed...
-            assert(os.path.isdir(user_restart_dir))
+        if (no_restarts or self.repeat_run) and user_restart_dir:
+            if not os.path.isdir(user_restart_dir):
+                raise ValueError(
+                    f"No restart directory found at {user_restart_dir}. "
+                    "Check 'restart:' field in config.yaml."
+                )
+            if self.counter > 0 and not self.repeat_run:
+                warnings.warn(
+                    "Starting run from restart directory (in config.yaml): "
+                    f"{user_restart_dir}"
+                )
             self.prior_restart_path = user_restart_dir
         else:
             prior_restart_dir = 'restart{0:03}'.format(self.counter - 1)
@@ -359,16 +379,17 @@ class Experiment(object):
             else:
                 self.prior_restart_path = None
                 if self.counter > 0 and not self.repeat_run:
-                    # TODO: This warning should be replaced with an abort in
-                    #       setup
-                    print('payu: warning: No restart files found.')
+                    warnings.warn(
+                        "No prior restart directory found in archive "
+                        "or specified in config.yaml"
+                    )
 
         for model in self.models:
             model.set_model_output_paths()
 
     def build_model(self):
 
-        # self.load_modules()
+        self.load_modules()
 
         for model in self.models:
             model.get_codebase()
@@ -376,7 +397,40 @@ class Experiment(object):
         for model in self.models:
             model.build_model()
 
+    def check_payu_version(self):
+        """Check current payu version is greater than minimum required
+        payu version, if configured"""
+        # TODO: Move this function to a setup file if setup is moved to
+        # a separate file?
+        minimum_version_fieldname = "payu_minimum_version"
+        if minimum_version_fieldname not in self.config:
+            # Skip version check
+            return
+
+        minimum_version = str(self.config[minimum_version_fieldname])
+        try:
+            # Attempt to parse the version
+            parsed_minimum_version = version.parse(minimum_version)
+        except version.InvalidVersion:
+            raise ValueError(
+                "Invalid version in configuration file (config.yaml) for "
+                f"'{minimum_version_fieldname}': {minimum_version}"
+            )
+
+        # Get the current version of the package
+        current_version = payu.__version__
+
+        # Compare versions
+        if version.parse(current_version) < parsed_minimum_version:
+            raise RuntimeError(
+                f"Payu version {current_version} does not meet the configured "
+                f"minimum version. A version >= {minimum_version} is "
+                "required to run this configuration."
+            )
+
     def setup(self, force_archive=False):
+        # Check version
+        self.check_payu_version()
 
         # Confirm that no output path already exists
         if os.path.exists(self.output_path):
@@ -416,6 +470,11 @@ class Experiment(object):
 
         make_symlink(self.work_path, self.work_sym_path)
 
+        # Set up executable paths - first search through paths added by modules
+        self.setup_modules()
+        for model in self.models:
+            model.setup_executable_paths()
+
         # Set up all file manifests
         self.manifest.setup()
 
@@ -449,12 +508,13 @@ class Experiment(object):
             # Testing
             prof.setup()
 
+        # Check restart pruning for valid configuration values and
+        # warns user if more restarts than expected would be pruned
+        if self.archiving():
+            self.get_restarts_to_prune()
+
     def run(self, *user_flags):
-
-        # XXX: This was previously done in reversion
-        envmod.setup()
-
-        # self.load_modules()
+        self.load_modules()
 
         f_out = open(self.stdout_fname, 'w')
         f_err = open(self.stderr_fname, 'w')
@@ -476,7 +536,7 @@ class Experiment(object):
             os.environ[var] = env_value
 
         mpi_config = self.config.get('mpi', {})
-        mpi_runcmd = mpi_config.get('runcmd', 'srun')
+        mpi_runcmd = mpi_config.get('runcmd', 'mpirun')
 
         if self.config.get('scalasca', False):
             mpi_runcmd = ' '.join(['scalasca -analyze', mpi_runcmd])
@@ -484,10 +544,15 @@ class Experiment(object):
         # MPI runtime flags
         mpi_flags = mpi_config.get('flags', [])
         if not mpi_flags:
-            mpi_flags = self.config.get('srun', [])
-            # TODO: Legacy config removal warning
+            # DEPRECATED: confusing and a duplication of flags config
+            if 'mpirun' in self.config:
+                mpi_flags = self.config.get('mpirun')
+                print('payu: warning: mpirun config option is deprecated.'
+                      '  Use mpi: flags option instead')
+            else:
+                mpi_flags = []
 
-        if type(mpi_flags) != list:
+        if not isinstance(mpi_flags, list):
             mpi_flags = [mpi_flags]
 
         # TODO: More uniform support needed here
@@ -510,26 +575,22 @@ class Experiment(object):
 
             mpi_config = self.config.get('mpi', {})
             mpi_module = mpi_config.get('module', None)
-            
-            print(f'mpi_config is {mpi_config}')
-            print(f'mpi_module is {mpi_module}')
 
             # Update MPI library module (if not explicitly set)
             # TODO: Check for MPI library mismatch across multiple binaries
-            if mpi_module is None:
-                mpi_module = envmod.lib_update(
-                    model.exec_path_local,
+            if mpi_module is None and model.required_libs is not None:
+                envmod.lib_update(
+                    model.required_libs,
                     'libmpi.so'
                 )
 
             model_prog = []
 
-            if mpi_module.startswith('mpich'):
-                # Our MPICH wrapper does not support a working directory flag
-                model_prog.append('-wdir {0}'.format(model.work_path))
-            elif self.config.get('scheduler') == 'slurm':
-                # Slurm's launcher controls the working directory
-                model_prog.append('--chdir {0}'.format(model.work_path))
+            wdir_arg = '-wdir'
+            if self.config.get('scheduler') == 'slurm':
+                # Option to set the working directory differs in slurm
+                wdir_arg = '--chdir'
+            model_prog.append(f'{wdir_arg} {model.work_path}')
 
             # Append any model-specific MPI flags
             model_flags = model.config.get('mpiflags', [])
@@ -549,12 +610,8 @@ class Experiment(object):
             model_npernode = model.config.get('npernode')
             # TODO: New Open MPI format?
             if model_npernode:
-                if model_npernode % 2 == 0:
-                    npernode_flag = ('-map-by ppr:{0}:socket'
-                                     ''.format(model_npernode / 2))
-                else:
-                    npernode_flag = ('-map-by ppr:{0}:node'
-                                     ''.format(model_npernode))
+                npernode_flag = ('-map-by ppr:{0}:node'
+                                  ''.format(model_npernode))
 
                 if self.config.get('scalasca', False):
                     npernode_flag = '\"{0}\"'.format(npernode_flag)
@@ -566,7 +623,7 @@ class Experiment(object):
 
             for prof in self.profilers:
                 if prof.runscript:
-                    model_prog = model_prog.append(prof.runscript)
+                    model_prog.append(prof.runscript)
 
             model_prog.append(model.exec_prefix)
 
@@ -574,7 +631,13 @@ class Experiment(object):
             # older MPI libraries complained executable was not in PATH
             model_prog.append(os.path.join(model.work_path, model.exec_name))
 
+            if model.exec_postfix:
+                model_prog.append(model.exec_postfix)
+
             mpi_progs.append(' '.join(model_prog))
+
+        # List all loaded environment modules
+        envmod.module("list")
 
         cmd = '{runcmd} {flags} {exes}'.format(
             runcmd=mpi_runcmd,
@@ -592,13 +655,6 @@ class Experiment(object):
         # TODO: Consider making this default
         if self.config.get('coredump', False):
             enable_core_dump()
-
-        # Our MVAPICH wrapper does not support working directories
-        if mpi_module.startswith('mvapich'):
-            curdir = os.getcwd()
-            os.chdir(self.work_path)
-        else:
-            curdir = None
 
         # Dump out environment
         with open(self.env_fname, 'w') as file:
@@ -620,16 +676,15 @@ class Experiment(object):
         else:
             rc = sp.call(shlex.split(cmd), stdout=f_out, stderr=f_err)
 
-        # Return to control directory
-        if curdir:
-            os.chdir(curdir)
-
         f_out.close()
         f_err.close()
 
         self.finish_time = datetime.datetime.now()
 
-        info = get_job_info()
+        scheduler_name = self.config.get('scheduler', DEFAULT_SCHEDULER_CONFIG)
+        scheduler = scheduler_index[scheduler_name]()
+
+        info = scheduler.get_job_info()
 
         if info is None:
             # Not being run under PBS, reverse engineer environment
@@ -675,10 +730,10 @@ class Experiment(object):
             error_log_dir = os.path.join(self.archive_path, 'error_logs')
             mkdir_p(error_log_dir)
 
-            # NOTE: This is PBS-specific
-            job_id = get_job_id(short=False)
+            # NOTE: This is only implemented for PBS scheduler
+            job_id = scheduler.get_job_id(short=False)
 
-            if job_id == '':
+            if job_id == '' or job_id is None:
                 job_id = str(self.run_id)[:6]
 
             for fname in self.output_fnames:
@@ -726,8 +781,16 @@ class Experiment(object):
         if run_script:
             self.run_userscript(run_script)
 
-    def archive(self):
-        if not self.config.get('archive', True):
+    def archiving(self):
+        """
+        Determine whether to run archive step based on config.yaml settings.
+        Default to True when archive settings are absent.
+        """
+        archive_config = self.config.get('archive', {})
+        return archive_config.get('enable', True)
+
+    def archive(self, force_prune_restarts=False):
+        if not self.archiving():
             print('payu: not archiving due to config.yaml setting.')
             return
 
@@ -757,35 +820,34 @@ class Experiment(object):
 
         movetree(self.work_path, self.output_path)
 
-        # Remove old restart files
-        # TODO: Move to subroutine
-        restart_freq = self.config.get('restart_freq', default_restart_freq)
-        restart_history = self.config.get('restart_history',
-                                          default_restart_history)
-
         # Remove any outdated restart files
-        prior_restart_dirs = [d for d in os.listdir(self.archive_path)
-                              if d.startswith('restart')]
+        try:
+            restarts_to_prune = self.get_restarts_to_prune(
+                force=force_prune_restarts)
+        except Exception as e:
+            print(e)
+            print("payu: error: Skipping pruning restarts")
+            restarts_to_prune = []
 
-        for res_dir in prior_restart_dirs:
-
-            res_idx = int(res_dir.lstrip('restart'))
-            if (self.repeat_run or
-                    (not res_idx % restart_freq == 0 and
-                     res_idx <= (self.counter - restart_history))):
-
-                res_path = os.path.join(self.archive_path, res_dir)
-
-                # Only delete real directories; ignore symbolic restart links
-                if (os.path.isdir(res_path) and not os.path.islink(res_path)):
-                    shutil.rmtree(res_path)
+        for restart in restarts_to_prune:
+            restart_path = os.path.join(self.archive_path, restart)
+            # Only delete real directories; ignore symbolic restart links
+            if (os.path.isdir(restart_path) and
+                    not os.path.islink(restart_path)):
+                shutil.rmtree(restart_path)
 
         # Ensure dynamic library support for subsequent python calls
         ld_libpaths = os.environ.get('LD_LIBRARY_PATH', None)
-        if ld_libpaths is not None:
-            py_libpath = sysconfig.get_config_var('LIBDIR')
-            if py_libpath not in ld_libpaths.split(':'):
-                os.environ['LD_LIBRARY_PATH'] = ':'.join([py_libpath, ld_libpaths])
+        py_libpath = sysconfig.get_config_var('LIBDIR')
+        if ld_libpaths is None:
+            os.environ['LD_LIBRARY_PATH'] = py_libpath
+        elif py_libpath not in ld_libpaths.split(':'):
+            os.environ['LD_LIBRARY_PATH'] = f'{py_libpath}:{ld_libpaths}'
+
+        # Run archive user script before collation job is submitted
+        archive_script = self.userscripts.get('archive')
+        if archive_script:
+            self.run_userscript(archive_script)
 
         collate_config = self.config.get('collate', {})
         collating = collate_config.get('enable', True)
@@ -805,15 +867,14 @@ class Experiment(object):
             )
             sp.check_call(shlex.split(cmd))
 
-        archive_script = self.userscripts.get('archive')
-        if archive_script:
-            self.run_userscript(archive_script)
-
-        # Ensure postprocess runs if model not collating
-        if not collating and self.postscript:
+        # Ensure postprocessing runs if model not collating
+        if not collating:
             self.postprocess()
 
     def collate(self):
+        # Setup modules - load user-defined modules
+        self.setup_modules()
+
         for model in self.models:
             model.collate()
 
@@ -822,87 +883,49 @@ class Experiment(object):
             model.profile()
 
     def postprocess(self):
-        """Submit a postprocessing script after collation"""
-        assert self.postscript
-        envmod.setup()
-        envmod.module('load', 'slurm')
+        """Submit any postprocessing scripts or remote syncing if enabled"""
 
-        cmd = 'srun {script}'.format(script=self.postscript)
+        # First submit postprocessing script
+        if self.postscript:
+            self.set_userscript_env_vars()
+            envmod.setup()
+            envmod.module('load', 'pbs')
 
-        cmd = shlex.split(cmd)
-        rc = sp.call(cmd)
-        assert rc == 0, 'Postprocessing script submission failed.'
+            cmd = 'qsub {script}'.format(script=self.postscript)
 
-    def remote_archive(self, config_name, archive_url=None,
-                       max_rsync_attempts=1, rsync_protocol=None):
+            if needs_subprocess_shell(cmd):
+                sp.check_call(cmd, shell=True)
+            else:
+                sp.check_call(shlex.split(cmd))
 
-        if not archive_url:
-            archive_url = default_archive_url
+        # Submit a sync script if remote syncing is enabled
+        sync_config = self.config.get('sync', {})
+        syncing = sync_config.get('enable', False)
+        if syncing:
+            cmd = '{python} {payu} sync'.format(
+                python=sys.executable,
+                payu=self.payu_path
+            )
 
-        archive_address = '{usr}@{url}'.format(usr=getpass.getuser(),
-                                               url=archive_url)
+            if self.postscript:
+                print('payu: warning: postscript is configured, so by default '
+                      'the lastest outputs will not be synced. To sync the '
+                      'latest output, after the postscript job has completed '
+                      'run:\n'
+                      '    payu sync')
+                cmd += f' --sync-ignore-last'
 
-        ssh_key_path = os.path.join(os.getenv('HOME'), '.ssh',
-                                    'id_rsa_file_transfer')
-
-        # Top-level path is implicitly set by the SSH key
-        # (Usually /projects/[group])
-
-        # Remote mkdir is currently not possible, so any new subdirectories
-        # must be created before auto-archival
-
-        remote_path = os.path.join(self.model_name, config_name, self.name)
-        remote_url = '{addr}:{path}'.format(addr=archive_address,
-                                            path=remote_path)
-
-        # Rsync ouput and restart files
-        rsync_cmd = ('rsync -a --safe-links -e "ssh -i {key}" '
-                     ''.format(key=ssh_key_path))
-
-        if rsync_protocol:
-            rsync_cmd += '--protocol={0} '.format(rsync_protocol)
-
-        run_cmd = rsync_cmd + '{src} {dst}'.format(src=self.output_path,
-                                                   dst=remote_url)
-        rsync_calls = [run_cmd]
-
-        if (self.counter % 5) == 0 and os.path.isdir(self.restart_path):
-            # Tar restart files before rsyncing
-            restart_tar_path = self.restart_path + '.tar.gz'
-
-            cmd = ('tar -C {0} -czf {1} {2}'
-                   ''.format(self.archive_path, restart_tar_path,
-                             os.path.basename(self.restart_path)))
             sp.check_call(shlex.split(cmd))
 
-            restart_cmd = ('{0} {1} {2}'
-                           ''.format(rsync_cmd, restart_tar_path, remote_url))
-            rsync_calls.append(restart_cmd)
-        else:
-            res_tar_path = None
+    def sync(self):
+        # RUN any user scripts before syncing archive
+        envmod.setup()
+        pre_sync_script = self.userscripts.get('sync')
+        if pre_sync_script:
+            self.run_userscript(pre_sync_script)
 
-        for model in self.models:
-            for input_path in self.model.input_paths:
-                # Using explicit path separators to rename the input directory
-                input_cmd = rsync_cmd + '{0} {1}'.format(
-                    input_path + os.path.sep,
-                    os.path.join(remote_url, 'input') + os.path.sep)
-                rsync_calls.append(input_cmd)
-
-        for cmd in rsync_calls:
-            cmd = shlex.split(cmd)
-
-            for rsync_attempt in range(max_rsync_attempts):
-                rc = sp.Popen(cmd).wait()
-                if rc == 0:
-                    break
-                else:
-                    print('rsync failed, reattempting')
-            assert rc == 0
-
-        # TODO: Temporary; this should be integrated with the rsync call
-        if res_tar_path and os.path.exists(res_tar_path):
-            os.remove(res_tar_path)
+        # Run rsync commmands
+        SyncToRemoteArchive(self).run()
 
     def resubmit(self):
         next_run = self.counter + 1
@@ -915,41 +938,24 @@ class Experiment(object):
         cmd = shlex.split(cmd)
         sp.call(cmd)
 
-    def run_userscript(self, script_cmd):
-        # First try to interpret the argument as a full command:
-        try:
-            sp.check_call(shlex.split(script_cmd))
-        except EnvironmentError as exc:
-            # Now try to run the script explicitly
-            if exc.errno == errno.ENOENT:
-                cmd = os.path.join(self.control_path, script_cmd)
-                # Simplistic recursion check
-                assert os.path.isfile(cmd)
-                self.run_userscript(cmd)
+    def set_userscript_env_vars(self):
+        """Save information of output directories and current run to
+        environment variables, so they can be accessed via user-scripts"""
+        os.environ.update(
+            {
+                'PAYU_CURRENT_OUTPUT_DIR': self.output_path,
+                'PAYU_CURRENT_RESTART_DIR': self.restart_path,
+                'PAYU_ARCHIVE_DIR': self.archive_path,
+                'PAYU_CURRENT_RUN': str(self.counter)
+            }
+        )
 
-            # If we get a "non-executable" error, then guess the type
-            elif exc.errno == errno.EACCES:
-                # TODO: Move outside
-                ext_cmd = {'.py': sys.executable,
-                           '.sh': '/bin/bash',
-                           '.csh': '/bin/tcsh'}
-
-                _, f_ext = os.path.splitext(script_cmd)
-                shell_name = ext_cmd.get(f_ext)
-                if shell_name:
-                    print('payu: warning: Assuming that {0} is a {1} script '
-                          'based on the filename extension.'
-                          ''.format(os.path.basename(script_cmd),
-                                    os.path.basename(shell_name)))
-                    cmd = ' '.join([shell_name, script_cmd])
-                    self.run_userscript(cmd)
-                else:
-                    # If we can't guess the shell, then abort
-                    raise
-        except sp.CalledProcessError as exc:
-            # If the script runs but the output is bad, then warn the user
-            print('payu: warning: user script \'{0}\' failed (error {1}).'
-                  ''.format(script_cmd, exc.returncode))
+    def run_userscript(self, script_cmd: str):
+        """Run a user defined script or subcommand at various stages of the
+        payu submissions"""
+        self.set_userscript_env_vars()
+        run_script_command(script_cmd,
+                           control_path=Path(self.control_path))
 
     def sweep(self, hard_sweep=False):
         # TODO: Fix the IO race conditions!
@@ -958,14 +964,13 @@ class Experiment(object):
         default_job_name = os.path.basename(os.getcwd())
         short_job_name = str(self.config.get('jobname', default_job_name))[:15]
 
+        log_filenames = [short_job_name + '.o', short_job_name + '.e']
+        for postfix in ['_c.o', '_c.e', '_p.o', '_p.e', '_s.o', '_s.e']:
+            log_filenames.append(short_job_name[:13] + postfix)
+
         logs = [
             f for f in os.listdir(os.curdir) if os.path.isfile(f) and (
-                f.startswith(short_job_name + '.o') or
-                f.startswith(short_job_name + '.e') or
-                f.startswith(short_job_name[:13] + '_c.o') or
-                f.startswith(short_job_name[:13] + '_c.e') or
-                f.startswith(short_job_name[:13] + '_p.o') or
-                f.startswith(short_job_name[:13] + '_p.e')
+                f.startswith(tuple(log_filenames))
             )
         ]
 
@@ -1011,6 +1016,135 @@ class Experiment(object):
         if os.path.islink(self.work_sym_path):
             print('Removing symlink {0}'.format(self.work_sym_path))
             os.remove(self.work_sym_path)
+
+    def get_restarts_to_prune(self,
+                              ignore_intermediate_restarts=False,
+                              force=False):
+        """Returns a list of restart directories that can be pruned"""
+        # Check if archive path exists
+        if not os.path.exists(self.archive_path):
+            return []
+
+        # Sorted list of restart directories in archive
+        restarts = list_archive_dirs(archive_path=self.archive_path,
+                                     dir_type='restart')
+        restart_indices = {}
+        for restart in restarts:
+            restart_indices[restart] = int(restart.lstrip('restart'))
+
+        # TODO: Previous logic was to prune all restarts if self.repeat_run
+        # Still need to figure out what should happen in this case
+        if self.repeat_run:
+            return [os.path.join(self.archive_path, restart)
+                    for restart in restarts]
+
+        # Use restart_freq to decide what restarts to prune
+        restarts_to_prune = []
+        intermediate_restarts, previous_intermediate_restarts = [], []
+        restart_freq = self.config.get('restart_freq', default_restart_freq)
+        if isinstance(restart_freq, int):
+            # Using integer frequency to prune restarts
+            for restart, restart_index in restart_indices.items():
+                if not restart_index % restart_freq == 0:
+                    intermediate_restarts.append(restart)
+                else:
+                    # Add any intermediate restarts to restarts to prune
+                    restarts_to_prune.extend(intermediate_restarts)
+                    previous_intermediate_restarts = intermediate_restarts
+                    intermediate_restarts = []
+        else:
+            # Using date-based frequency to prune restarts
+            try:
+                date_offset = parse_date_offset(restart_freq)
+            except ValueError as e:
+                print('payu: error: Invalid configuration for restart_freq:',
+                      restart_freq)
+                raise
+
+            next_dt = None
+            for restart in restarts:
+                # Use model-driver to parse restart directory for a datetime
+                restart_path = os.path.join(self.archive_path, restart)
+                try:
+                    restart_dt = self.model.get_restart_datetime(restart_path)
+                except NotImplementedError:
+                    print('payu: error: Date-based restart pruning is not '
+                          f'implemented for the {self.model.model_type} '
+                          'model. To use integer based restart pruning, '
+                          'set restart_freq to an integer value.')
+                    raise
+                except FileNotFoundError as e:
+                    print(f'payu: warning: Ignoring {restart} from date-based '
+                          f'restart pruning. Error: {e}')
+                    continue
+                except Exception:
+                    print('payu: error: Error parsing restart directory ',
+                          f'{restart} for a datetime to prune restarts.')
+                    raise
+
+                if (next_dt is not None and restart_dt < next_dt):
+                    intermediate_restarts.append(restart)
+                else:
+                    # Keep the earliest datetime and use last kept datetime
+                    # as point of reference when adding the next time interval
+                    next_dt = date_offset.add_to_datetime(restart_dt)
+
+                    # Add intermediate restarts to restarts to prune
+                    restarts_to_prune.extend(intermediate_restarts)
+                    previous_intermediate_restarts = intermediate_restarts
+                    intermediate_restarts = []
+
+        if ignore_intermediate_restarts:
+            # Return all restarts that'll eventually be pruned
+            restarts_to_prune.extend(intermediate_restarts)
+            return restarts_to_prune
+
+        if not force:
+            # check environment for --force-prune-restarts flag
+            force = os.environ.get('PAYU_FORCE_PRUNE_RESTARTS', False)
+
+        # Flag to check whether more restarts than expected will be deleted
+        is_unexpected = restarts_to_prune != previous_intermediate_restarts
+
+        # Restart_history override
+        restart_history = self.config.get('restart_history', None)
+        if restart_history is not None:
+            if not isinstance(restart_history, int):
+                raise ValueError("payu: error: restart_history is not an "
+                                 f"integer value: {restart_history}")
+
+            if len(restarts) > 0:
+                max_index = restart_indices[restarts[-1]]
+                index_bound = max_index - restart_history
+
+                # Keep restart_history latest restarts, in addition to the
+                # permanently saved restarts defined by restart_freq
+                restarts_to_prune.extend(intermediate_restarts)
+                restarts_to_prune = [res for res in restarts_to_prune
+                                     if restart_indices[res] <= index_bound]
+
+                # Expect at most 1 restart to be pruned with restart_history
+                is_unexpected = len(restarts_to_prune) > 1
+
+        # Log out warning if more restarts than expected will be deleted
+        if not force and is_unexpected:
+            config_info = (f'restart pruning frequency of {restart_freq}')
+            if restart_history:
+                config_info += f' and restart history of {restart_history}'
+
+            print(f'payu: warning: Current {config_info} would result in '
+                  'following restarts being pruned: '
+                  f'{" ".join(restarts_to_prune)}\n'
+                  'If this is expected, use --force-prune-restarts flag at '
+                  'next run or archive (if running archive manually), e.g.:\n'
+                  '     payu run --force-prune-restarts, or\n'
+                  '     payu archive --force-prune-restarts\n'
+                  'Otherwise, no restarts will be pruned')
+
+            # Return empty list to prevent restarts being pruned
+            restarts_to_prune = []
+
+        return restarts_to_prune
 
 
 def enable_core_dump():
